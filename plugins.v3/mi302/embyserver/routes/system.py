@@ -1,0 +1,277 @@
+"""System / Users / Sessions 等雜項端點。"""
+
+from __future__ import annotations
+
+import json
+import platform
+from urllib.parse import parse_qsl
+
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
+from starlette.concurrency import run_in_threadpool
+
+from ..auth import AuthContext, client_info, require_admin, require_user
+from ..dto import query_result, user_dto
+from ..ratelimit import TooManyAttempts
+from .common import as_user, q, state
+
+router = APIRouter()
+
+# 回給播放器的是「假裝成哪一版 Emby」，不是 Mi302 自己的版本（那個在 embyserver.__version__）
+EMBY_VERSION = "4.8.11.0"
+# platform.system() 的名稱換成 Emby 的 OperatingSystem 寫法（MediaBrowser.Model.System.OperatingSystem）
+OS_NAMES = {"Darwin": "OSX", "FreeBSD": "BSD", "OpenBSD": "BSD", "NetBSD": "BSD"}
+
+
+def _operating_system() -> str:
+    name = platform.system()
+    return OS_NAMES.get(name, name or "Linux")
+
+
+def _local_address(request: Request) -> str:
+    return f"{request.url.scheme}://{request.url.netloc}"
+
+
+def _public_info(request: Request) -> dict:
+    st = state(request)
+    return {
+        "LocalAddress": _local_address(request),
+        "LocalAddresses": [_local_address(request)],
+        "RemoteAddresses": [],
+        "ServerName": st.config.server.name,
+        "Version": EMBY_VERSION,
+        "ProductName": "Emby Server",
+        "OperatingSystem": _operating_system(),
+        "Id": st.server_id,
+        "StartupWizardCompleted": True,
+    }
+
+
+@router.api_route("/system/info/public", methods=["GET", "HEAD"])
+def system_info_public(request: Request):
+    return _public_info(request)
+
+
+@router.api_route("/system/info", methods=["GET", "HEAD"])
+def system_info(request: Request, ctx: AuthContext = Depends(require_user)):
+    port = request.url.port or (443 if request.url.scheme == "https" else 80)
+    info = _public_info(request)
+    info.update(
+        {
+            "OperatingSystemDisplayName": platform.platform(),
+            "HasPendingRestart": False,
+            "IsShuttingDown": False,
+            "SupportsLibraryMonitor": False,
+            "WebSocketPortNumber": port,
+            "HttpServerPortNumber": port,
+            "HttpsPortNumber": port,
+            "SupportsHttps": request.url.scheme == "https",
+            "CanSelfRestart": False,
+            "CanSelfUpdate": False,
+            "CanLaunchWebBrowser": False,
+            "HasUpdateAvailable": False,
+            "SupportsAutoRunAtStartup": False,
+            "HardwareAccelerationRequiresPremiere": False,
+            "SystemUpdateLevel": "Release",
+            "CompletedInstallations": [],
+            "WanAddress": None,
+        }
+    )
+    return info
+
+
+@router.api_route("/system/ping", methods=["GET", "POST", "HEAD"])
+def ping():
+    return Response(content="Emby Server", media_type="text/plain")
+
+
+@router.get("/system/endpoint")
+def system_endpoint():
+    return {"IsLocal": True, "IsInNetwork": True}
+
+
+@router.get("/branding/configuration")
+def branding():
+    return {"LoginDisclaimer": "", "CustomCss": "", "SplashscreenEnabled": False}
+
+
+# ---------------- Users ----------------
+
+
+@router.get("/users/public")
+def users_public(request: Request):
+    st = state(request)
+    if not st.config.server.public_users:
+        return []
+    return [user_dto(u, st.server_id, st.config.server.allow_download) for u in st.auth.list_users()]
+
+
+@router.post("/users/authenticatebyname")
+async def authenticate_by_name(request: Request):
+    st = state(request)
+    body: dict = {}
+    ctype = request.headers.get("content-type", "")
+    raw = await request.body()
+    if raw:
+        if "json" in ctype or raw.lstrip().startswith(b"{"):
+            try:
+                body = json.loads(raw)
+            except ValueError:
+                body = {}
+            if not isinstance(body, dict):  # [] 或 null 是合法的 JSON，但不是登入資料
+                raise HTTPException(status_code=400, detail="Invalid request body.")
+        else:
+            # 表單（application/x-www-form-urlencoded）自己解析：request.form() 要另裝 python-multipart
+            body = dict(parse_qsl(raw.decode("utf-8", "replace"), keep_blank_values=True))
+    lb = {str(k).lower(): v for k, v in body.items()}
+    username = lb.get("username") or q(request, "username") or ""
+    password = lb.get("pw")
+    if password is None:
+        password = lb.get("password")
+    if password is None:
+        password = q(request, "pw", "") or ""
+    # 帳號密碼不是文字（[1]、123）時 .strip()、.encode() 會 500；太長的不必算雜湊
+    if not isinstance(username, str) or not isinstance(password, str) or len(username) > 256 or len(password) > 1024:
+        raise HTTPException(status_code=400, detail="Invalid username or password.")
+    info = client_info(request)
+    source = request.client.host if request.client else ""
+
+    def login():
+        # 驗證密碼要算幾十毫秒的雜湊，不能擋住事件迴圈，其他人的播放請求會跟著卡
+        found = st.auth.authenticate(username, password, source)
+        if not found:
+            return None, None
+        return st.auth.get_user(found["id"]), st.auth.issue_token(found, info)
+
+    try:
+        user, token = await run_in_threadpool(login)
+    except TooManyAttempts as exc:  # 猜太多次：先擋一陣子
+        raise HTTPException(status_code=429, detail=str(exc), headers={"Retry-After": str(int(exc.retry_after) + 1)})
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid username or password entered.")
+    return {
+        "User": user_dto(user, st.server_id, st.config.server.allow_download),
+        "SessionInfo": _session_info(request, user, info),
+        "AccessToken": token,
+        "ServerId": st.server_id,
+    }
+
+
+def _session_info(request: Request, user: dict, info: dict) -> dict:
+    st = state(request)
+    return {
+        "PlayState": {"CanSeek": False, "IsPaused": False, "IsMuted": False, "RepeatMode": "RepeatNone"},
+        "AdditionalUsers": [],
+        "RemoteEndPoint": request.client.host if request.client else "",
+        "PlayableMediaTypes": ["Audio", "Video"],
+        "Id": info.get("deviceid", "") or "session",
+        "ServerId": st.server_id,
+        "UserId": user["id"],
+        "UserName": user["name"],
+        "Client": info.get("client", ""),
+        "DeviceName": info.get("device", ""),
+        "DeviceId": info.get("deviceid", ""),
+        "ApplicationVersion": info.get("version", ""),
+        "SupportedCommands": [],
+        "SupportsRemoteControl": False,
+    }
+
+
+@router.get("/users")
+def users_list(request: Request, ctx: AuthContext = Depends(require_admin)):
+    st = state(request)
+    return [user_dto(u, st.server_id, st.config.server.allow_download) for u in st.auth.list_users()]
+
+
+@router.get("/users/query")
+def users_query(request: Request, ctx: AuthContext = Depends(require_admin)):
+    """和 /Users 一樣，包成 {Items, TotalRecordCount}（MoviePilot 用它算有幾個使用者）。要放在 /users/{user_id} 前面。"""
+    users = users_list(request, ctx)
+    return query_result(users, len(users))
+
+
+@router.get("/users/{user_id}")
+def user_get(user_id: str, request: Request, ctx: AuthContext = Depends(require_user)):
+    st = state(request)
+    user = as_user(request, ctx, user_id).user  # 只能看自己；管理員看得到別人
+    return user_dto(user, st.server_id, st.config.server.allow_download)
+
+
+@router.post("/sessions/logout")
+def logout(request: Request, ctx: AuthContext = Depends(require_user)):
+    state(request).auth.revoke(ctx.token)
+    return Response(status_code=204)
+
+
+# ---------------- Sessions / 偏好設定 ----------------
+
+
+@router.api_route("/sessions/capabilities", methods=["POST"])
+@router.api_route("/sessions/capabilities/full", methods=["POST"])
+def capabilities(ctx: AuthContext = Depends(require_user)):
+    return Response(status_code=204)
+
+
+@router.get("/sessions")
+def sessions(ctx: AuthContext = Depends(require_user)):
+    return []
+
+
+@router.get("/displaypreferences/{pref_id}")
+def display_prefs_get(pref_id: str, request: Request):
+    return {
+        "Id": pref_id,
+        "SortBy": "SortName",
+        "SortOrder": "Ascending",
+        "RememberIndexing": False,
+        "PrimaryImageHeight": 250,
+        "PrimaryImageWidth": 250,
+        "CustomPrefs": {},
+        "ScrollDirection": "Horizontal",
+        "ShowBackdrop": True,
+        "RememberSorting": False,
+        "ShowSidebar": False,
+        "Client": q(request, "client", "emby"),
+    }
+
+
+@router.post("/displaypreferences/{pref_id}")
+def display_prefs_set(pref_id: str):
+    return Response(status_code=204)
+
+
+@router.get("/users/{user_id}/groupingoptions")
+def grouping_options(user_id: str):
+    return []
+
+
+@router.get("/plugins")
+def plugins():
+    return []
+
+
+@router.get("/localization/{kind}")
+def localization(kind: str):
+    return []
+
+
+@router.websocket("/embywebsocket")
+async def emby_websocket(ws: WebSocket):
+    await ws.accept()
+    try:
+        while True:
+            msg = await ws.receive_text()
+            try:
+                data = json.loads(msg)
+            except ValueError:
+                continue
+            if data.get("MessageType") == "KeepAlive":
+                await ws.send_text(json.dumps({"MessageType": "KeepAlive"}))
+    except WebSocketDisconnect:
+        pass
+
+
+@router.post("/library/refresh")
+def library_refresh(request: Request, ctx: AuthContext = Depends(require_admin)):
+    scanner = state(request).scanner
+    scanner.in_background(scanner.scan_all)
+    return Response(status_code=204)

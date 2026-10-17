@@ -1,0 +1,353 @@
+"""115 開放平台（open.115.com）通道。
+
+詳細說明見 docs/modules.md 的「embyserver/p115_open.py」。
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+import logging
+import secrets
+import threading
+import time
+from typing import Dict, Iterator, List, Optional, Tuple
+
+import httpx
+
+from .db import Database
+from .http_util import GuardedClient, header_value
+
+log = logging.getLogger(__name__)
+
+OPEN_BASE = "https://proapi.115.com"
+AUTH_DEVICE_CODE = "https://passportapi.115.com/open/authDeviceCode"
+DEVICE_CODE_TO_TOKEN = "https://passportapi.115.com/open/deviceCodeToToken"
+REFRESH_TOKEN = "https://passportapi.115.com/open/refreshToken"
+QRCODE_STATUS = "https://qrcodeapi.115.com/get/status/"
+QRCODE_IMAGE = "https://qrcodeapi.115.com/api/1.0/web/1.0/qrcode"
+OPEN_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+TOKEN_META_KEY = "p115_open_token"
+REFRESH_LEAD = 300  # 過期前 5 分鐘續期
+
+# access_token 失效，刷新後重試
+AUTH_EXPIRED_CODES = {40140124, 40140125, 40140126}
+# refresh_token 失效，需要重新掃碼
+REFRESH_DEAD_CODE = 40140116
+
+
+class P115OpenError(Exception):
+    def __init__(self, message: str, code: int = 0):
+        super().__init__(message)
+        self.code = code
+
+
+def _state_ok(value) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value == 1
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "1")
+    return False
+
+
+def _pkce_pair() -> tuple[str, str]:
+    verifier = base64.urlsafe_b64encode(secrets.token_bytes(48)).rstrip(b"=").decode()
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    return verifier, challenge
+
+
+def parse_download_url(data) -> Optional[str]:
+    """downurl 回傳格式不一：字串、{url: …}、{url: {url: …}}、{file_id: {url: {url: …}}}。"""
+    if isinstance(data, str):
+        return data if data.startswith("http") else None
+    if isinstance(data, dict):
+        url = data.get("url")
+        if isinstance(url, str) and url.startswith("http"):
+            return url
+        if isinstance(url, dict) and str(url.get("url", "")).startswith("http"):
+            return url["url"]
+        for value in data.values():
+            found = parse_download_url(value)
+            if found:
+                return found
+    return None
+
+
+class P115OpenClient:
+    def __init__(self, db: Database, app_id: str = "", timeout: float = 15.0, transport=None):
+        self.db = db
+        self.default_app_id = app_id
+        self._client = GuardedClient(P115OpenError, timeout=timeout, transport=transport)
+        self._sessions: Dict[str, tuple[str, str]] = {}  # uid -> (app_id, verifier)
+        self._refresh_lock = threading.Lock()
+
+    def set_timeout(self, seconds: float) -> None:
+        self._client.timeout = seconds  # 之後的請求就用新的逾時
+
+    def close(self) -> None:
+        self._client.close()
+
+    # ---------------- token ----------------
+
+    def _load(self) -> Optional[dict]:
+        raw = self.db.get_meta(TOKEN_META_KEY)
+        return json.loads(raw) if raw else None
+
+    def _save(self, token: Optional[dict]) -> None:
+        self.db.set_meta(TOKEN_META_KEY, json.dumps(token) if token else "")
+
+    @property
+    def authorized(self) -> bool:
+        token = self._load()
+        return bool(token and token.get("refresh_token"))
+
+    def status(self) -> dict:
+        token = self._load() or {}
+        return {
+            "authorized": self.authorized,
+            "app_id": token.get("app_id") or self.default_app_id,
+            "expires_at": token.get("expires_at"),
+        }
+
+    def logout(self) -> None:
+        self._save(None)
+
+    def _store_token(self, app_id: str, data: dict, old_refresh: str = "") -> dict:
+        token = {
+            "app_id": app_id,
+            "access_token": data["access_token"],
+            "refresh_token": data.get("refresh_token") or old_refresh,
+            "expires_at": int(time.time()) + int(data.get("expires_in") or 7200),
+        }
+        self._save(token)
+        return token
+
+    def access_token(self, force_refresh: bool = False) -> str:
+        token = self._load()
+        if not token or not token.get("refresh_token"):
+            raise P115OpenError("尚未授權 115 開放平台", REFRESH_DEAD_CODE)
+        if not force_refresh and token.get("access_token") and token["expires_at"] - REFRESH_LEAD > time.time():
+            return token["access_token"]
+        with self._refresh_lock:
+            # 等鎖期間可能已被其他執行緒刷新
+            latest = self._load() or token
+            if not force_refresh and latest.get("expires_at", 0) - REFRESH_LEAD > time.time():
+                return latest["access_token"]
+            if force_refresh and latest.get("access_token") != token.get("access_token"):
+                return latest["access_token"]
+            try:
+                data = self._post_form(REFRESH_TOKEN, {"refresh_token": latest["refresh_token"]})
+            except P115OpenError as exc:
+                if exc.code == REFRESH_DEAD_CODE:
+                    self._save(None)
+                    raise P115OpenError("開放平台授權已失效，請重新掃碼", exc.code) from exc
+                raise
+            if not data.get("access_token"):
+                raise P115OpenError("刷新 token 失敗：回應沒有 access_token")
+            log.info("115 開放平台 token 已續期")
+            return self._store_token(latest.get("app_id", ""), data, latest["refresh_token"])["access_token"]
+
+    # ---------------- HTTP ----------------
+
+    def _envelope(self, resp: httpx.Response):
+        if resp.status_code == 401:
+            raise P115OpenError("HTTP 401 未授權", 40140124)
+        try:
+            body = resp.json()
+        except ValueError as exc:
+            raise P115OpenError(f"115 開放平台回應不是 JSON：HTTP {resp.status_code}") from exc
+        if not _state_ok(body.get("state")):
+            raise P115OpenError(body.get("message") or body.get("error") or "未知錯誤", int(body.get("code") or 0))
+        return body
+
+    def _post_form(self, url: str, form: dict) -> dict:
+        resp = self._client.post(url, data=form, headers={"User-Agent": OPEN_UA})
+        return self._envelope(resp).get("data") or {}
+
+    def _call(self, method: str, path: str, params=None, form=None, user_agent: str = "") -> dict:
+        """呼叫開放平台 API。access_token 過期時強制刷新、再送一次；第二次還失敗就丟出去。"""
+
+        def send(token: str) -> dict:
+            resp = self._client.request(
+                method,
+                OPEN_BASE + path,
+                params=params,
+                data=form,
+                headers={"Authorization": f"Bearer {token}", "User-Agent": header_value(user_agent or OPEN_UA)},
+            )
+            return self._envelope(resp)
+
+        token = self.access_token()
+        try:
+            return send(token)
+        except P115OpenError as exc:
+            if exc.code not in AUTH_EXPIRED_CODES:
+                raise
+        return send(self.access_token(force_refresh=True))
+
+    # ---------------- 掃碼授權 ----------------
+
+    def qrcode_start(self, app_id: str = "") -> dict:
+        app_id = (app_id or self.default_app_id or (self._load() or {}).get("app_id") or "").strip()
+        if not app_id:
+            raise P115OpenError("請先填寫 115 開放平台的 AppID")
+        verifier, challenge = _pkce_pair()
+        data = self._post_form(
+            AUTH_DEVICE_CODE,
+            {"client_id": app_id, "code_challenge": challenge, "code_challenge_method": "sha256"},
+        )
+        uid = data.get("uid")
+        if not uid:
+            raise P115OpenError("取得授權二維碼失敗，AppID 可能無效")
+        self._sessions[str(uid)] = (app_id, verifier)
+        return {
+            "uid": str(uid),
+            "time": str(data.get("time", "")),
+            "sign": str(data.get("sign", "")),
+            "qrcode_image": f"{QRCODE_IMAGE}?uid={uid}",
+        }
+
+    def qrcode_status(self, uid: str, time_: str, sign: str) -> dict:
+        resp = self._client.get(
+            QRCODE_STATUS, params={"uid": uid, "time": time_, "sign": sign}, headers={"User-Agent": OPEN_UA}
+        )
+        try:
+            body = resp.json()
+        except ValueError:
+            return {"status": "waiting"}
+        code = (body.get("data") or {}).get("status")
+        if code in (None, 0):
+            if body.get("message") == "key invalid":
+                return {"status": "expired"}  # 二維碼過期；不回報的話網頁會一直「等待掃描」
+            return {"status": "waiting"}
+        if code == 1:
+            return {"status": "scanned"}
+        if code == 2:
+            session = self._sessions.pop(uid, None)
+            if not session:
+                raise P115OpenError("授權會話已失效，請重新產生二維碼")
+            app_id, verifier = session
+            data = self._post_form(DEVICE_CODE_TO_TOKEN, {"uid": uid, "code_verifier": verifier})
+            if not data.get("access_token"):
+                raise P115OpenError("換取 token 失敗：回應沒有 access_token")
+            self._store_token(app_id, data)
+            log.info("115 開放平台授權成功")
+            return {"status": "success"}
+        self._sessions.pop(uid, None)
+        return {"status": "canceled" if code == -2 else "expired"}
+
+    # ---------------- 檔案 ----------------
+
+    def download_url(self, pickcode: str, user_agent: str = "") -> str:
+        body = self._call("POST", "/open/ufile/downurl", form={"pick_code": pickcode}, user_agent=user_agent)
+        url = parse_download_url(body.get("data"))
+        if not url:
+            raise P115OpenError(f"開放平台沒有回傳下載網址：{pickcode}")
+        return url
+
+    def dir_id(self, path: str) -> int:
+        path = "/" + path.strip("/")
+        if path == "/":
+            return 0
+        body = self._call("GET", "/open/folder/get_info", params={"path": path})
+        data = body.get("data") or {}
+        cid = int(data.get("file_id") or data.get("fid") or 0)
+        if not cid:
+            raise P115OpenError(f"115 上找不到目錄：{path}")
+        return cid
+
+    def user_info(self) -> dict:
+        return self._call("GET", "/open/user/info").get("data") or {}
+
+    def dir_ancestors(self, cid: int) -> List[Tuple[int, str]]:
+        from .p115 import ancestor_chain
+
+        body = self._call("GET", "/open/ufile/files", params={"cid": cid, "limit": 1, "show_dir": 1, "cur": 1})
+        return ancestor_chain(body.get("path"), cid)
+
+    def iter_changed_files(self, cid: int, since: float) -> Iterator[dict]:
+        offset = 0
+        while True:
+            body = self._call(
+                "GET", "/open/ufile/files",
+                params={
+                    "cid": cid, "cur": 0, "show_dir": 0, "o": "user_utime", "asc": 0,
+                    "custom_order": 2, "limit": 1000, "offset": offset,
+                },
+            )
+            items = body.get("data")
+            count = body.get("count")
+            if isinstance(items, dict):
+                count = items.get("count", count)
+                items = items.get("list")
+            items = items or []
+            newer = 0
+            for info in items:
+                if str(info.get("fc", info.get("file_category", "1"))) == "0":
+                    continue
+                mtime = int(float(info.get("upt") or info.get("uet") or info.get("te") or 0))
+                if mtime < since:
+                    continue
+                newer += 1
+                yield {
+                    "name": info.get("fn") or info.get("file_name") or "",
+                    "id": int(info.get("fid") or info.get("file_id") or 0),
+                    "parent_id": int(info.get("pid") or info.get("parent_id") or info.get("cid") or 0),
+                    "pickcode": info.get("pc") or info.get("pick_code") or "",
+                    "size": int(info.get("fs") or info.get("size") or 0),
+                    "mtime": mtime,
+                    "sha1": str(info.get("sha1") or info.get("sha") or "").upper(),
+                }
+            offset += len(items)
+            if not items or not newer or offset >= int(count or 0):
+                return
+
+    def recycle_bin(self, offset: int, limit: int) -> dict:
+        """回收站的一頁（原始回應，p115.parse_recycle_bin 解析）。"""
+        return self._call("GET", "/open/rb/list", params={"limit": limit, "offset": offset})
+
+    def recycle_bin_clean(self) -> None:
+        """清空回收站（不帶 tid 就是全部）；開放平台不用安全密鑰。"""
+        self._call("POST", "/open/rb/del", form={})
+
+    def list_dir(self, cid: int) -> List[dict]:
+        out: List[dict] = []
+        offset = 0
+        while True:
+            body = self._call(
+                "GET", "/open/ufile/files",
+                params={"cid": cid, "limit": 1000, "offset": offset, "show_dir": 1, "cur": 1},
+            )
+            items = body.get("data")
+            count = body.get("count")
+            if isinstance(items, dict):  # 部分回應把清單包在 data.list
+                count = items.get("count", count)
+                items = items.get("list")
+            items = items or []
+            # cid 失效時 115 會靜默回傳根目錄
+            path = body.get("path") or []
+            if cid != 0 and path and str(path[-1].get("cid", cid)) != str(cid):
+                from .p115 import P115NotFound  # 和 cookie 通道丟同一種錯，同步才知道是「已刪掉」而不是失敗
+
+                raise P115NotFound(f"115 目錄不存在：{cid}")
+            for info in items:
+                is_dir = str(info.get("fc", info.get("file_category", "1"))) == "0"
+                out.append(
+                    {
+                        "name": info.get("fn") or info.get("file_name") or "",
+                        "is_dir": is_dir,
+                        "id": int(info.get("fid") or info.get("file_id") or 0),
+                        "pickcode": info.get("pc") or info.get("pick_code") or info.get("pickcode") or "",
+                        "size": int(info.get("fs") or info.get("s") or info.get("size") or 0),
+                        "mtime": int(info.get("upt") or info.get("te") or 0),
+                    }
+                )
+            offset += len(items)
+            if not items or offset >= int(count or 0):
+                break
+        return out

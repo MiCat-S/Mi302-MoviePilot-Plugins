@@ -1,0 +1,202 @@
+"""整理 115 網盤：清單、問 MoviePilot 檢查、預覽、執行、全部整理、集數定位推薦、瀏覽 115 裡挑的資料夾、刪除、整理工作的進度。"""
+
+from __future__ import annotations
+
+from fastapi import APIRouter, Depends, HTTPException, Request
+from starlette.concurrency import run_in_threadpool
+
+from ...auth import AuthContext, require_admin
+from ...organize115 import BIG_FOLDER, P115_NEEDED, OrganizeError
+from ...reorganize import ReorgError
+from ..common import q, q_int, state
+from .common import json_body
+
+router = APIRouter()
+
+MP_NEEDED = "還沒設定 MoviePilot：到「MoviePilot」頁填網址和 API 令牌再儲存"
+
+
+def _can_organize(st) -> None:
+    """預覽、執行、全部整理都要設定好 MoviePilot、登入 115；在拿鎖、開執行緒之前就擋下來。"""
+    ready = st.reorganizer.ready()
+    if not ready["moviepilot"]:
+        raise HTTPException(status_code=400, detail=MP_NEEDED)
+    if not ready["p115"]:
+        raise HTTPException(status_code=400, detail=P115_NEEDED)
+
+
+def _run(fn, *args):
+    try:
+        return fn(*args)
+    except (OrganizeError, ReorgError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@router.get("/web/api/115/organize")
+def organize_list(request: Request, ctx: AuthContext = Depends(require_admin)):
+    """要整理的資料夾：問過 MoviePilot 名稱不一樣的、集號不對的（q 搜尋、kind=series|movie|episodes|held、
+    root=只看這個同步目錄底下的、offset、limit）；
+    瀏覽 115 加進來的在 pinned。附上背景檢查的進度（job）、還沒問過的數量（unchecked）、缺什麼設定（ready）、
+    目前的整理工作（reorg_job）。不向 MoviePilot 請求。"""
+    st = state(request)
+    offset, limit = max(q_int(request, "offset") or 0, 0), min(max(q_int(request, "limit") or 50, 1), 200)
+    result = st.organizer.list(q(request, "q") or "", q(request, "kind") or "", offset, limit, q(request, "root") or "")
+    return {**result, "offset": offset, "ready": st.reorganizer.ready(), "reorg_job": st.reorganizer.job.as_dict()}
+
+
+@router.get("/web/api/115/organize/job")
+def organize_job(request: Request, ctx: AuthContext = Depends(require_admin)):
+    """目前（或上一次）的整理工作、全部整理的進度（不含跳過、失敗的明細，明細看 GET /web/api/115/organize/all）、
+    刪除勾選的進度（deleting）。"""
+    st = state(request)
+    return {"job": st.reorganizer.job.as_dict(), "batch": st.organizer.batch.as_dict(results=False),
+            "deleting": st.organizer.deleting.as_dict(), "ready": st.reorganizer.ready()}
+
+
+@router.get("/web/api/115/organize/all")
+def organize_all_status(request: Request, ctx: AuthContext = Depends(require_admin)):
+    """全部整理的進度，和跳過、失敗的每一個（名稱、路徑、原因）。"""
+    return state(request).organizer.batch.as_dict()
+
+
+@router.post("/web/api/115/organize/all")
+async def organize_all(request: Request, ctx: AuthContext = Depends(require_admin)):
+    """全部整理：{q, kind, root（清單上的搜尋、種類、同步目錄）, target, target_path, cleanup, max_videos}。清單上符合的（加上瀏覽 115
+    釘上來的）在背景一個一個預覽，沒問題的直接整理，有問題的跳過記下來；標了「先不整理」的、一次要送超過 max_videos
+    支影片的（預設 300，0 = 不限）這次不做。進度看 GET /web/api/115/organize/job。"""
+    st = state(request)
+    body = await json_body(request)
+    _can_organize(st)
+    try:
+        max_videos = int(body.get("max_videos", BIG_FOLDER))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="max_videos 要是整數")
+    return {"batch": await run_in_threadpool(
+        _run, st.organizer.organize_all, str(body.get("q") or ""), str(body.get("kind") or ""), str(body.get("target") or ""),
+        str(body.get("target_path") or ""), bool(body.get("cleanup", True)), max_videos, str(body.get("root") or ""))}
+
+
+@router.post("/web/api/115/organize/hold")
+async def organize_hold(request: Request, ctx: AuthContext = Depends(require_admin)):
+    """「先不整理」：{id, hold}。全部整理時跳過、排到清單後面；單獨整理還是可以。回傳那一列。"""
+    body = await json_body(request)
+    return _run(state(request).organizer.hold, str(body.get("id") or ""), bool(body.get("hold", True)))
+
+
+@router.post("/web/api/115/organize/all/stop")
+def organize_all_stop(request: Request, ctx: AuthContext = Depends(require_admin)):
+    """全部整理做完手上這一個就停。"""
+    return {"batch": state(request).organizer.stop_all()}
+
+
+@router.post("/web/api/115/organize/check")
+async def organize_check(request: Request, ctx: AuthContext = Depends(require_admin)):
+    """在背景問 MoviePilot 每個資料夾整理後叫什麼：{"refresh": true} 連問過的也重問。進度看 GET /web/api/115/organize。"""
+    st = state(request)
+    body = await json_body(request)
+    started = _run(st.organizer.check_in_background, bool(body.get("refresh")))
+    return {"started": started, "job": st.organizer.job.as_dict()}
+
+
+@router.post("/web/api/115/organize/check/stop")
+def organize_check_stop(request: Request, ctx: AuthContext = Depends(require_admin)):
+    """停止檢查：問完手上這幾個就停，問過的留著，沒問的下次再問。"""
+    st = state(request)
+    return {"stopped": st.organizer.stop_check(), "job": st.organizer.job.as_dict()}
+
+
+@router.post("/web/api/115/organize/folder")
+async def organize_folder(request: Request, ctx: AuthContext = Depends(require_admin)):
+    """瀏覽 115 裡挑的資料夾：{cid, path}。列一次目錄、問 MoviePilot 叫什麼，釘在清單最上面；回傳它。"""
+    st = state(request)
+    body = await json_body(request)
+    try:
+        cid = int(body.get("cid") or 0)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="cid 要是資料夾 id（數字）")
+    return await run_in_threadpool(_run, st.organizer.folder_unit, cid, str(body.get("path") or ""))
+
+
+@router.delete("/web/api/115/organize/folder/{unit_id}")
+def organize_unpin(unit_id: str, request: Request, ctx: AuthContext = Depends(require_admin)):
+    state(request).organizer.unpin(unit_id)
+    return {"ok": True}
+
+
+@router.post("/web/api/115/organize/preview")
+async def organize_preview(request: Request, ctx: AuthContext = Depends(require_admin)):
+    """請 MoviePilot 只算不做：{id, parts: {部分: {type: tv|movie, tmdbid, season, format}}, target: auto（預設）|parent|path,
+    target_path, scrape（預設 False）}，沒指定的讓 MoviePilot 自己認。回傳每個檔案的新位置、它認成什麼和 Mi302 的檢查；
+    有能整理的就給預覽代碼 token，用 POST /web/api/115/organize/execute 執行。"""
+    st = state(request)
+    body = await json_body(request)
+    _can_organize(st)
+    parts = body.get("parts") if isinstance(body.get("parts"), dict) else {}
+    overrides = {str(k): v for k, v in parts.items() if isinstance(v, dict)}
+    return await run_in_threadpool(_run, st.organizer.preview, str(body.get("id") or ""), overrides,
+                                   str(body.get("target") or ""), str(body.get("target_path") or ""), bool(body.get("scrape", False)))
+
+
+@router.post("/web/api/115/organize/recommend")
+async def organize_recommend(request: Request, ctx: AuthContext = Depends(require_admin)):
+    """一部分的集數定位模板：{id, part}。先請 MoviePilot 推薦，推薦不出來再用 Mi302 從檔名看的（source 標明）。"""
+    st = state(request)
+    body = await json_body(request)
+    return await run_in_threadpool(_run, st.organizer.recommend, str(body.get("id") or ""), str(body.get("part") or ""))
+
+
+@router.post("/web/api/115/organize/execute")
+async def organize_execute(request: Request, ctx: AuthContext = Depends(require_admin)):
+    """照預覽執行：{"tokens": [...], "cleanup": [{cid, path}]}；整理完沒有影片留下的來源資料夾移到 115 回收站。
+    在背景跑，進度看 GET /web/api/115/organize/job。"""
+    st = state(request)
+    body = await json_body(request)
+    _can_organize(st)
+    if st.organizer.deleting.running:
+        raise HTTPException(status_code=400, detail="正在刪除勾選的，等它做完再整理")
+    tokens = body.get("tokens") if isinstance(body.get("tokens"), list) else [body.get("token")]
+    cleanup = [c for c in body.get("cleanup") or [] if isinstance(c, dict) and str(c.get("cid") or "").isdecimal()]
+    _run(st.reorganizer.execute_in_background, [str(t or "") for t in tokens], cleanup)
+    return {"job": st.reorganizer.job.as_dict()}
+
+
+@router.post("/web/api/115/organize/execute/stop")
+def organize_execute_stop(request: Request, ctx: AuthContext = Depends(require_admin)):
+    """停止執行：送給 MoviePilot 的這一批做完，還沒送的不送，也不清舊資料夾。"""
+    st = state(request)
+    return {"stopped": st.reorganizer.cancel(), "job": st.reorganizer.job.as_dict()}
+
+
+@router.get("/web/api/115/organize/episodes")
+def organize_episodes(request: Request, ctx: AuthContext = Depends(require_admin)):
+    """一部劇在媒體庫裡的每一集（給刪除對話框勾），集號不對的標 problem；附上劇集資料夾。只看資料庫。"""
+    st = state(request)
+    return _run(st.reorganizer.series_files, q_int(request, "series") or 0, q_int(request, "season"))
+
+
+@router.post("/web/api/115/organize/delete")
+async def organize_delete(request: Request, ctx: AuthContext = Depends(require_admin)):
+    """刪除，都是送進 115 回收站（可以還原），本機 strm、nfo 和媒體庫跟著拿掉。要用掃碼登入 115。
+    {id}：清單上的一個整個刪掉（劇集或電影資料夾、沒有自己資料夾的電影、瀏覽 115 加進來的資料夾）；
+    {series_id, file_ids, remove_folder}：刪劇的這幾集，劇集資料夾刪空了可以一起移走；
+    {ids: [...]}：清單上勾選的整個刪掉，在背景一個一個做，進度看 GET /web/api/115/organize/job 的 deleting。"""
+    st = state(request)
+    body = await json_body(request)
+    if isinstance(body.get("ids"), list):
+        ids = [str(i) for i in body["ids"]]
+        return {"deleting": await run_in_threadpool(_run, st.organizer.delete_many_in_background, ids)}
+    if body.get("id"):
+        return await run_in_threadpool(_run, st.organizer.delete, str(body["id"]))
+    ids = [int(i) for i in body.get("file_ids") or [] if str(i).isdecimal()]
+    try:
+        series_id = int(body.get("series_id") or 0)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="series_id 格式錯誤")
+    return await run_in_threadpool(_run, st.reorganizer.delete_episodes, series_id, ids, bool(body.get("remove_folder")))
+
+
+@router.post("/web/api/115/organize/delete/stop")
+def organize_delete_stop(request: Request, ctx: AuthContext = Depends(require_admin)):
+    """停止刪除勾選的：做完手上這一個就停，已經移到 115 回收站的留在回收站。"""
+    st = state(request)
+    return {"stopped": st.organizer.stop_delete(), "deleting": st.organizer.deleting.as_dict()}

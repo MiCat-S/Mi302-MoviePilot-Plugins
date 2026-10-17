@@ -1,0 +1,232 @@
+"""PlaybackInfo、串流（strm 302）與播放進度回報。"""
+
+from __future__ import annotations
+
+import json
+import logging
+import mimetypes
+from pathlib import Path
+from typing import Optional
+from urllib.parse import urlsplit
+
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi.responses import FileResponse, RedirectResponse
+from starlette.concurrency import run_in_threadpool
+
+from .. import logs
+from ..auth import AuthContext, now_iso, require_user
+from ..dto import media_source_dto
+from ..mediainfo import MediaInfoStore
+from ..p115 import P115Error
+from .common import as_user, q, q_int, set_user_data, state
+
+log = logging.getLogger(__name__)
+router = APIRouter()
+
+WATCHED_RATIO = 0.9  # 停下來時播到片長的九成以上，算看完了
+
+# 這些路徑名稱不是影片本體，不能被當成串流處理
+NON_MEDIA_NAMES = {
+    "additionalparts", "subtitles", "similar", "thememedia", "themevideos",
+    "themesongs", "specialfeatures", "linkeditems", "playbackinfo",
+}
+
+
+@router.api_route("/items/{item_id}/playbackinfo", methods=["GET", "POST"])
+def playback_info(item_id: str, request: Request, ctx: AuthContext = Depends(require_user)):
+    st = state(request)
+    row = st.db.get_item(item_id)
+    if not row or row["type"] not in ("Movie", "Episode"):
+        raise HTTPException(status_code=404, detail="Item not found")
+    remote = st.redirector.display_target(row, str(request.base_url))
+    # 有媒體資訊（X-mediainfo.json）時一起回傳，播放器不必自己探測就知道解析度、音軌、字幕軌
+    info = MediaInfoStore(st.db).get(row["path"])
+    ms = media_source_dto(row, remote, ctx.token, info)
+    if not info and row["is_strm"]:
+        st.prober.enqueue(row["path"])  # 打開即探測：排進背景，不等；下次打開就有
+    ms_id = q(request, "MediaSourceId")
+    if ms_id and ms_id != ms["Id"]:
+        log.debug("PlaybackInfo MediaSourceId 不符：%s", ms_id)
+    return {
+        "MediaSources": [ms],
+        "PlaySessionId": f"{item_id}-{ctx.user_id[:8]}",
+    }
+
+
+def _stream(item_id: str, name: str, request: Request):
+    if name.split(".", 1)[0] in NON_MEDIA_NAMES:
+        raise HTTPException(status_code=404, detail="Not found")
+    st = state(request)
+    if st.config.redirect.require_auth:
+        require_user(request)
+    row = st.db.get_item(item_id)
+    if not row or row["type"] not in ("Movie", "Episode"):
+        raise HTTPException(status_code=404, detail="Item not found")
+
+    if row["is_strm"]:
+        headers = {k.lower(): v for k, v in request.headers.items()}
+        try:
+            url = st.redirector.final_url(row, headers)
+        except P115Error as exc:
+            log.warning("播放 %s 失敗：%s", Path(row["path"]).name, exc)
+            raise HTTPException(status_code=502, detail=str(exc))
+        if url:
+            log.info(
+                "播放 %s：302 到 %s（%s）",
+                Path(row["path"]).name, urlsplit(url).netloc or url[:60], request.headers.get("user-agent", "")[:60],
+            )
+            log.debug("302 完整網址：%s", logs.redact(url))
+            return RedirectResponse(url=url, status_code=302)
+        # strm 裡寫的是本機路徑：直接送檔
+        target = st.redirector.strm_target(row)
+        if target and Path(target).is_file():
+            return _file(target)
+        raise HTTPException(status_code=404, detail="strm 內容無效")
+    return _file(row["path"])
+
+
+def _file(path: str) -> FileResponse:
+    media_type = mimetypes.guess_type(path)[0] or "application/octet-stream"
+    return FileResponse(path, media_type=media_type)
+
+
+@router.api_route("/videos/{item_id}/{name}", methods=["GET", "HEAD"])
+def video_stream(item_id: str, name: str, request: Request):
+    return _stream(item_id, name, request)
+
+
+@router.api_route("/items/{item_id}/download", methods=["GET", "HEAD"])
+@router.api_route("/items/{item_id}/file", methods=["GET", "HEAD"])
+def item_download(item_id: str, request: Request, ctx: AuthContext = Depends(require_user)):
+    # 下載要登入，也可以整個關掉（server.allow_download）
+    if not state(request).config.server.allow_download:
+        raise HTTPException(status_code=403, detail="下載功能已關閉")
+    return _stream(item_id, "stream", request)
+
+
+# ---------------- 播放進度 ----------------
+
+
+async def _json_body(request: Request) -> dict:
+    raw = await request.body()
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else {}
+    except ValueError:
+        return {}
+
+
+def _ticks(value) -> Optional[int]:
+    """播放器回報裡的片長；不是數字（字串、Infinity）就當成沒給，不能讓回報變成 500。"""
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _report(request: Request, ctx: AuthContext, body: dict, stopped: bool) -> Response:
+    lb = {k.lower(): v for k, v in body.items()}
+    item_id = lb.get("itemid") or q(request, "ItemId")
+    if not item_id:
+        return Response(status_code=204)
+    st = state(request)
+    row = st.db.get_item(item_id)
+    if not row:
+        return Response(status_code=204)
+    pos = lb.get("positionticks")
+    if pos is None:
+        pos = q_int(request, "PositionTicks")
+    try:
+        pos = int(pos)
+    except (TypeError, ValueError, OverflowError):
+        # 沒帶位置（舊版 API 的開始播放一定不帶）：不知道播到哪，只記最後播放時間，不能把續播點清成 0，
+        # 也不拿去學片頭（會把「從 0 跳到續播點」當成跳過片頭）
+        set_user_data(request, ctx, item_id, last_played=now_iso())
+        return Response(status_code=204)
+    fields = {"last_played": now_iso(), "position_ticks": pos}
+    runtime: Optional[int] = row["runtime_ticks"] or _ticks(lb.get("runtimeticks"))
+    st.intro.report(ctx.user_id, row, pos, stopped)  # 從播放行為學片頭片尾
+    finished = bool(stopped and runtime and pos >= runtime * WATCHED_RATIO)
+    if finished:
+        fields.update(played=1, position_ticks=0)
+    set_user_data(request, ctx, item_id, **fields)
+    if finished:
+        st.db.execute(
+            "UPDATE user_data SET play_count=play_count+1 WHERE user_id=? AND item_id=?",
+            (ctx.user_id, row["id"]),
+        )
+    return Response(status_code=204)
+
+
+@router.post("/sessions/playing")
+async def playing_start(request: Request, ctx: AuthContext = Depends(require_user)):
+    body = await _json_body(request)
+    return await run_in_threadpool(_report, request, ctx, body, stopped=False)
+
+
+@router.post("/sessions/playing/progress")
+async def playing_progress(request: Request, ctx: AuthContext = Depends(require_user)):
+    body = await _json_body(request)
+    return await run_in_threadpool(_report, request, ctx, body, stopped=False)
+
+
+@router.post("/sessions/playing/stopped")
+async def playing_stopped(request: Request, ctx: AuthContext = Depends(require_user)):
+    body = await _json_body(request)
+    return await run_in_threadpool(_report, request, ctx, body, stopped=True)
+
+
+# ---------------- 片頭片尾（Jellyfin Intro Skipper 外掛、Jellyfin 10.10 媒體片段的格式） ----------------
+
+
+def _episode(request: Request, item_id: str):
+    row = state(request).db.get_item(item_id)
+    if not row or row["type"] != "Episode":
+        raise HTTPException(status_code=404, detail="Episode not found")
+    return row
+
+
+@router.get("/episode/{item_id}/introtimestamps")
+@router.get("/episode/{item_id}/introtimestamps/v1")
+def intro_timestamps(item_id: str, request: Request, ctx: AuthContext = Depends(require_user)):
+    row = _episode(request, item_id)
+    intro = state(request).intro.skipper_for(row)["Introduction"]
+    if not intro["Valid"]:
+        raise HTTPException(status_code=404, detail="No intro")  # 外掛沒有片頭時也是 404
+    return intro
+
+
+@router.get("/episode/{item_id}/timestamps")
+def episode_timestamps(item_id: str, request: Request, ctx: AuthContext = Depends(require_user)):
+    return state(request).intro.skipper_for(_episode(request, item_id))
+
+
+@router.get("/mediasegments/{item_id}")
+def media_segments(item_id: str, request: Request, ctx: AuthContext = Depends(require_user)):
+    row = state(request).db.get_item(item_id)
+    items = state(request).intro.segments_for(row) if row else []
+    return {"Items": items, "TotalRecordCount": len(items), "StartIndex": 0}
+
+
+@router.post("/sessions/playing/ping")
+def playing_ping():
+    return Response(status_code=204)
+
+
+# 舊版 API：/Users/{uid}/PlayingItems/{id}
+@router.post("/users/{user_id}/playingitems/{item_id}")
+def legacy_start(user_id: str, item_id: str, request: Request, ctx: AuthContext = Depends(require_user)):
+    return _report(request, as_user(request, ctx, user_id), {"ItemId": item_id}, stopped=False)
+
+
+@router.post("/users/{user_id}/playingitems/{item_id}/progress")
+def legacy_progress(user_id: str, item_id: str, request: Request, ctx: AuthContext = Depends(require_user)):
+    return _report(request, as_user(request, ctx, user_id), {"ItemId": item_id}, stopped=False)
+
+
+@router.delete("/users/{user_id}/playingitems/{item_id}")
+@router.post("/users/{user_id}/playingitems/{item_id}/delete")
+def legacy_stop(user_id: str, item_id: str, request: Request, ctx: AuthContext = Depends(require_user)):
+    return _report(request, as_user(request, ctx, user_id), {"ItemId": item_id}, stopped=True)
